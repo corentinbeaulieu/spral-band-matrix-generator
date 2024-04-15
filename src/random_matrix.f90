@@ -26,7 +26,8 @@ module spral_random_matrix
                                                  ! but nnz<min(m,n)
 
   interface random_matrix_generate
-     module procedure random_matrix_generate32, random_matrix_generate64
+     module procedure random_matrix_generate32, random_matrix_generate64,    &
+         random_matrix_generate32_band, random_matrix_generate64_band
   end interface random_matrix_generate
 contains
 
@@ -274,6 +275,279 @@ contains
   end subroutine random_matrix_generate64
 
 !
+! Generate a random m x n band matrix with nnz non-zeroes.
+! User can additionally specify a symmetric matrix (requires m==n), forced
+! non-singularity, and the sorting of entries within columns.
+! User can specify a upper band width (lower is the same) to generate
+! a band matrix. A bandwidth <= 0 should have the same behaviour as the
+! not band variant.
+!
+  subroutine random_matrix_generate32_band(state, matrix_type, m, n, nnz, bw, ptr, row, &
+       flag, stat, val, nonsingular, sort)
+    implicit none
+    type(random_state), intent(inout) :: state ! random generator to use
+    integer, intent(in) :: matrix_type ! ignored except for symmetric/unsymmetric
+      ! (in future will be used for complex sym vs hermitian at least)
+    integer, intent(in) :: m ! number of rows
+    integer, intent(in) :: n ! number of columns
+    integer, intent(in) :: nnz ! number of entries
+    integer, intent(in) :: bw ! upper/lower bw
+    integer, dimension(n+1), intent(out) :: ptr ! column pointers
+    integer, dimension(nnz), intent(out) :: row ! row indices
+    integer, intent(out) :: flag ! return code
+    integer, optional, intent(out) :: stat ! allocate error code
+    real(wp), dimension(nnz), optional, intent(out) :: val ! numerical values
+    logical, optional, intent(in) :: nonsingular ! force matrix to be explicitly
+      ! non-singular. If not present, treated as .false.
+    logical, optional, intent(in) :: sort ! sort entries in columns by row index.
+      ! If not present, treated as .false.
+
+    integer(long), dimension(:), allocatable :: ptr64
+    integer :: st
+
+   ! Create temporary 64-bit version of ptr
+    allocate(ptr64(n+1), stat=st)
+    if (st .ne. 0) then
+       flag = ERROR_ALLOCATION
+       if (present(stat)) stat = st
+       return
+    end if
+
+    ! Call 64-bit version
+    call random_matrix_generate64_band(state, matrix_type, m, n, int(nnz,long), &
+      bw, ptr64, row, flag, stat=stat, val=val,                     &
+      nonsingular=nonsingular, sort=sort)
+
+    ! ... and copy back to 32-bit ptr
+    ptr(:) = int(ptr64(:))
+  end subroutine random_matrix_generate32_band
+
+! Generate a random m x n band matrix with nnz non-zeroes.
+! User can additionally specify a symmetric matrix (requires m==n), forced
+! non-singularity, and the sorting of entries within columns.
+! User can specify a upper band width (lower is the same) to generate
+! a band matrix. A bandwidth <= 0 should have the same behaviour as the
+! not band variant.
+!
+! FIXME: This routine will be slow if we're asked for a (near) dense matrix
+! In this case, we might be better served by finding holes or using the first
+! part of random permutations
+! The band constrains worsen this issue as the allowed positions are fewer.
+  subroutine random_matrix_generate64_band(state, matrix_type, m, n, nnz, bw, ptr, row, &
+       flag, stat, val, nonsingular, sort)
+    implicit none
+    type(random_state), intent(inout) :: state ! random generator to use
+    integer, intent(in) :: matrix_type ! ignored except for symmetric/unsymmetric
+      ! (in future will be used for complex sym vs hermitian at least)
+    integer, intent(in) :: m ! number of rows
+    integer, intent(in) :: n ! number of columns
+    integer(long), intent(in) :: nnz ! number of entries
+    integer, intent(in) :: bw ! upper/lower bw
+    integer(long), dimension(n+1), intent(out) :: ptr ! column pointers
+    integer, dimension(nnz), intent(out) :: row ! row indices
+    integer, intent(out) :: flag ! return code
+    integer, optional, intent(out) :: stat ! allocate error code
+    real(wp), dimension(nnz), optional, intent(out) :: val ! numerical values
+    logical, optional, intent(in) :: nonsingular ! force matrix to be explicitly
+      ! non-singular. If not present, treated as .false.
+    logical, optional, intent(in) :: sort ! sort entries in columns by row index.
+      ! If not present, treated as .false.
+
+    integer :: i, j, k, minidx, maxidx
+    integer(long) :: ii, jj
+    integer, dimension(:), allocatable :: cnt, rperm, cperm
+    logical, dimension(:), allocatable :: rused
+    logical :: lsymmetric, lnonsingular, lsort
+    integer :: st
+
+    ! Initialize return codes
+    flag = 0
+    if (present(stat)) stat = 0
+
+    ! Generate local logical flags
+    lnonsingular = .false.
+    if (present(nonsingular)) lnonsingular = nonsingular
+    lsort = .false.
+    if (present(sort)) lsort = sort
+
+    ! Handle matrix type
+    select case (matrix_type)
+    case(SPRAL_MATRIX_UNSPECIFIED, SPRAL_MATRIX_REAL_RECT)
+       lsymmetric = .false.
+    case(SPRAL_MATRIX_REAL_UNSYM)
+       lsymmetric = .false.
+       if (m .ne. n) then
+          ! Matrix is not square - did user mean SPRAL_MATRIX_REAL_RECT?
+          flag = ERROR_NONSQUARE
+          return
+       end if
+    case(SPRAL_MATRIX_REAL_SYM_PSDEF, SPRAL_MATRIX_REAL_SYM_INDEF, &
+         SPRAL_MATRIX_REAL_SKEW)
+       lsymmetric = .true.
+       if (m .ne. n) then
+          ! Matrix is not square - did user mean SPRAL_MATRIX_REAL_RECT?
+          flag = ERROR_NONSQUARE
+          return
+       end if
+    case default
+       ! COMPLEX or unknown matrix type
+       flag = ERROR_MATRIX_TYPE
+       return
+    end select
+
+    ! Check args
+    if ((m .lt. 1) .or. (n .lt. 1) .or. (nnz .lt. 1)) then
+       ! Args out of range
+       flag = ERROR_ARG
+       return
+    end if
+    if ((lsymmetric .and. (n*(n+1_long)/2 .lt. nnz)) .or. &
+         ((.not. lsymmetric) .and. (m*(n+0_long) .lt. nnz))) then
+       ! Too many non-zeroes for matrix
+       flag = ERROR_ARG
+       return
+    end if
+    if (lnonsingular .and. (nnz .lt. min(m,n))) then
+       ! Requested a non-singular matrix, but not enough non-zeroes
+       flag = ERROR_SINGULAR
+       return
+    end if
+
+    ! Allocate non-zeroes to columns
+    allocate(cnt(n), stat=st)
+    if (st .ne. 0) goto 100
+    cnt(:) = 0
+    if (lsymmetric) then
+       ! In symmetric case, structural non-singularity is guarunteed by adding
+       ! the diagonal
+       if (lnonsingular) then
+          allocate(rperm(m), cperm(n), stat=st)
+          if (st .ne. 0) goto 100
+          ! To be consistent with unsymmetric case, we satisfy the following
+          ! through identity permutations:
+          ! If cperm(i)<=min(m,n) then that column has a structural non-zero
+          ! in position rperm(cperm(i))
+          do i = 1, n
+             rperm(i) = i
+             cperm(i) = i
+          end do
+          cnt(cperm(:)) = cnt(cperm(:)) + 1
+       end if
+       ! Generate column assignments of remaining entries
+       ii = nnz; if(lnonsingular) ii = nnz - min(m,n) ! Allow for forced non-sing
+       do ii = 1, ii
+          j = random_sym_wt_integer(state, n)
+          do while (((bw .gt. 0) .and. (cnt(j) .ge. bw+1)) .or. (cnt(j) .ge. (m-j+1)))
+             j = random_sym_wt_integer(state, n)
+          end do
+          cnt(j) = cnt(j) + 1
+       end do
+    else
+       ! If we force (structural) non-singularity, generate locations and
+       ! add to column counts
+       if (lnonsingular) then
+          allocate(rperm(m), cperm(n), stat=st)
+          if (st .ne. 0) goto 100
+          ! We generate random permutations of rows and columns
+          ! We use the first min(m,n) of each permutation
+          ! If cperm(i)<=min(m,n) then that column has a structural non-zero
+          ! in position rperm(cperm(i))
+          ! [i.e. rperm gives actual rows, cperm doesn't - its an inverse]
+          ! call random_perm(state, m, rperm)
+          ! call random_perm(state, n, cperm)
+          ! where (cperm(:) .le. min(m,n)) cnt(:) = 1
+          do i = 1, n
+             rperm(i) = i
+             cperm(i) = i
+          end do
+          cnt(cperm(:)) = cnt(cperm(:)) + 1
+       end if
+       ! Generate column assignments of remaining entries
+       ii = nnz; if(lnonsingular) ii = nnz - min(m,n) ! Allow for forced non-sing
+       do ii = 1, ii
+          j = random_integer(state, n)
+          do while (((bw .gt. 0) .and. &
+              ((cnt(j) .ge. (2*bw)+1) .or. (cnt(j) .ge. (m-j+1+bw)) .or.&
+              (cnt(j) .ge. (j+bw)))) &
+              .or. (cnt(j) .ge. m))
+             j = random_integer(state, n)
+          end do
+          cnt(j) = cnt(j) + 1
+       end do
+       if (sum(cnt) .ne. nnz) stop
+    end if
+
+    ! Determine row values
+    allocate(rused(m), stat=st)
+    if (st .ne. 0) goto 100
+    rused(:) = .false.
+    ptr(1) = 1
+    do i = 1, n
+       ! Determine the bound of the band
+       minidx = i - bw
+       if ((bw .le. 0) .or. (minidx .le. 0)) then
+           minidx = 1
+       endif
+       maxidx = i + bw
+       if ((bw .le. 0) .or. (maxidx .gt. m)) then
+           maxidx = m
+       endif
+       if (lsymmetric) minidx = i
+
+       ! Determine end of col
+       ptr(i+1) = ptr(i) + cnt(i)
+       jj = ptr(i)
+       ! Add non-singular entry if required
+       if (lnonsingular) then
+          if (cperm(i) .le. min(m,n)) then
+             k = rperm(cperm(i))
+             if ((k .lt. minidx) .or. (k .gt. maxidx)) then
+                 k = random_integer_in_range(state, minidx, maxidx)
+             endif
+             row(jj) = k
+             rused(k) = .true.
+             jj = jj + 1
+          end if
+       end if
+
+       ! Add normal entries
+       do jj = jj, ptr(i+1)-1
+          k = random_integer_in_range(state, minidx, maxidx)
+          do while (rused(k))
+             k = random_integer_in_range(state, minidx, maxidx)
+          end do
+          row(jj) = k
+          rused(k) = .true.
+       end do
+       ! Reset rused(:)
+       do jj = ptr(i), ptr(i+1)-1
+          rused(row(jj)) = .false.
+       end do
+    end do
+
+    ! Optionally, sort
+    if (lsort) then
+       call dbl_tr_sort(m, n, ptr, row, st)
+       if (st .ne. 0) goto 100
+    end if
+
+    ! Determine values
+    if (present(val)) then
+       do jj = 1, ptr(n+1)-1
+          val(jj) = random_real(state)
+       end do
+    end if
+
+    return ! Normal return
+
+100 continue
+    ! Memory allocation failure
+    flag = ERROR_ALLOCATION
+    if (present(stat)) stat = st
+    return
+  end subroutine random_matrix_generate64_band
+
+!
 ! Returns a random number in range [1,n] weighted by number of entries in
 ! lower half triangle
 !
@@ -333,6 +607,7 @@ contains
        perm(j) = temp
     end do
   end subroutine random_perm
+
 
 !
 ! Sort a matrix's columns to increase row order

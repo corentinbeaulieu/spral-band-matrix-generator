@@ -538,6 +538,18 @@ contains
        end do
     end if
 
+    ! Positive Definite Case
+    if (matrix_type .eq. SPRAL_MATRIX_REAL_SYM_PSDEF) then
+        do j = 1, n
+            do jj = ptr(j), ptr(j+1)
+                if (row(jj) .eq. j) then
+                    val(jj) = cnt(j) + 0.1
+                    exit
+                end if
+            end do
+        end do
+    end if
+
     return ! Normal return
 
 100 continue

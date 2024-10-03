@@ -436,9 +436,9 @@ contains
        ! Generate column assignments of remaining entries
        ii = nnz; if(lnonsingular) ii = nnz - min(m,n) ! Allow for forced non-sing
        do ii = 1, ii
-          j = random_sym_wt_integer(state, n)
+          j = random_integer(state, n)
           do while (((bw .gt. 0) .and. (cnt(j) .ge. bw+1)) .or. (cnt(j) .ge. (m-j+1)))
-             j = random_sym_wt_integer(state, n)
+             j = random_integer(state, n)
           end do
           cnt(j) = cnt(j) + 1
        end do
